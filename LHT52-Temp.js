@@ -1,117 +1,125 @@
-// ChirpStack v4 JavaScript codec for Dragino LWL02 (Door & Water Leak)
+// ChirpStack v4 JS codec — Dragino LHT52
+// Output field names are aligned to your Node-RED function:
+// fPort=2: TempC_SHT, Hum_SHT, TempC_DS
+// fPort=5: battery_v / battery_mv / Bat_mV (+ battery_pct)
 
 function decodeUplink(input) {
-  var result = decodeLWL02(input.fPort, input.bytes, input.variables);
+  const bytes = input.bytes || [];
+  const fPort = input.fPort;
 
-  return {
-    data: result.data,
-    warnings: result.warnings,
-    errors: result.errors
+  const data = {
+    node_type: "LHT52",
+    Node_type: "LHT52"
   };
+  const warnings = [];
+  const errors = [];
+
+  if (!bytes.length) {
+    errors.push("Empty payload");
+    return { data, warnings, errors };
+  }
+
+  function u16be(i) {
+    return ((bytes[i] << 8) | bytes[i + 1]) >>> 0;
+  }
+  function i16be(i) {
+    let v = u16be(i);
+    if (v & 0x8000) v -= 0x10000;
+    return v;
+  }
+  function u32be(i) {
+    return (
+      ((bytes[i] << 24) >>> 0) |
+      (bytes[i + 1] << 16) |
+      (bytes[i + 2] << 8) |
+      (bytes[i + 3])
+    ) >>> 0;
+  }
+  function round(n, d) {
+    const p = Math.pow(10, d);
+    return Math.round(n * p) / p;
+  }
+  function hex2(b) {
+    return ("0" + (b & 0xff).toString(16)).slice(-2);
+  }
+  function hex4(v) {
+    return ("000" + (v & 0xffff).toString(16)).slice(-4);
+  }
+
+  // ---------------- fPort 2: Live sensor values (11 bytes) ----------------
+  if (fPort === 2) {
+    if (bytes.length === 11) {
+      // According to Dragino format: Temp (int16, /100), Hum (uint16, /10), ExtTemp DS (int16, /100),
+      // Ext flag, Unix timestamp (uint32). :contentReference[oaicite:1]{index=1}
+      data.TempC_SHT = round(i16be(0) / 100.0, 2);
+      data.Hum_SHT   = round(u16be(2) / 10.0, 1);
+
+      const rawDSu16 = u16be(4);
+      if (rawDSu16 === 0x7FFF) {
+        // Common "not available" marker
+        warnings.push("TempC_DS not available (0x7FFF)");
+      } else {
+        data.TempC_DS = round(i16be(4) / 100.0, 2);
+      }
+
+      data.Ext = bytes[6];                 // 0/1 (external probe connected)
+      data.Systimestamp = u32be(7);        // unix timestamp
+      return { data, warnings, errors };
+    } else {
+      data.Status = "RPL data or sensor reset";
+      warnings.push(`Unexpected payload length ${bytes.length} on fPort 2 (expected 11)`);
+      return { data, warnings, errors };
+    }
+  }
+
+  // ---------------- fPort 3: Datalog (variable length) ----------------
+  if (fPort === 3) {
+    data.Status = "Datalog payload (fPort=3) - parse entries in application if needed";
+    return { data, warnings, errors };
+  }
+
+  // ---------------- fPort 4: DS18B20 ID (8 bytes) ----------------
+  if (fPort === 4) {
+    if (bytes.length < 8) {
+      warnings.push(`Unexpected payload length ${bytes.length} on fPort 4 (expected 8)`);
+    }
+    data.DS18B20_ID = bytes.map(hex2).join("");
+    return { data, warnings, errors };
+  }
+
+  // ---------------- fPort 5: Device / battery info ----------------
+  if (fPort === 5) {
+    if (bytes.length < 7) {
+      warnings.push(`Unexpected payload length ${bytes.length} on fPort 5 (expected >= 7)`);
+      return { data, warnings, errors };
+    }
+
+    data.Sensor_Model = bytes[0];
+    const fw = ((bytes[1] << 8) | bytes[2]) & 0xffff;
+    data.Firmware_Version = "0x" + hex4(fw);
+    data.Freq_Band = bytes[3];
+    data.Sub_Band  = bytes[4];
+
+    const bat_mV = ((bytes[5] << 8) | bytes[6]) >>> 0;
+    data.Bat_mV = bat_mV;           // matches your Node-RED fallback
+    data.battery_mv = bat_mV;
+    data.battery_v  = round(bat_mV / 1000.0, 3);
+
+    // battery_pct as in your Node-RED logic (2.8–3.6V)
+    const minV = 2.8;
+    const maxV = 3.6;
+    let pct = (data.battery_v - minV) / (maxV - minV) * 100;
+    pct = Math.max(0, Math.min(100, pct));
+    data.battery_pct = Math.round(pct);
+
+    return { data, warnings, errors };
+  }
+
+  warnings.push(`Unhandled fPort ${fPort}`);
+  return { data, warnings, errors };
 }
 
-function decodeLWL02(fPort, bytes, variables) {
-  var data = {
-    node_type: "LWL02",
-    Node_type: "LWL02"
-  };
-
-  var warnings = [];
-  var errors = [];
-
-  if (!bytes || bytes.length === 0) {
-    errors.push("Empty payload");
-    return { data: data, warnings: warnings, errors: errors };
-  }
-
-  // ------------------------------------------------------------------
-  // Basis-Felder (immer dekodieren, sofern mind. 3 Bytes da sind)
-  // ------------------------------------------------------------------
-  if (bytes.length < 3) {
-    errors.push("Payload too short: " + bytes.length + " bytes");
-    return { data: data, warnings: warnings, errors: errors };
-  }
-
-  // Battery (erste 14 Bit)
-  var raw_value = ((bytes[0] << 8) | bytes[1]) & 0x3FFF;
-  var bat_mV = raw_value;          // laut Dragino: direkt in mV
-  var batV   = bat_mV / 1000.0;    // in Volt
-
-  data.BAT_V      = batV;          // Originalname aus Dragino-Beispiel
-  data.battery_mv = bat_mV;        // einheitlicher Feldname
-  data.battery_v  = batV;
-
-  // einfache Batterie-Kennlinie 2.8–3.6 V (wie LHT52-Beispiel)
-  var minV = 2.8;
-  var maxV = 3.6;
-  var pct  = (batV - minV) / (maxV - minV) * 100;
-  pct = Math.max(0, Math.min(100, pct));
-  data.battery_pct = Math.round(pct);
-
-  // Status-Bits
-  var door_open_status   = (bytes[0] & 0x80) ? 1 : 0; // 1: open, 0: close
-  var water_leak_status  = (bytes[0] & 0x40) ? 1 : 0;
-
-  data.DOOR_OPEN_STATUS  = door_open_status;
-  data.WATER_LEAK_STATUS = water_leak_status;
-
-  // Mode
-  var mod = bytes[2];
-  data.MOD = mod;
-
-  // Alarm-Bit (letztes Byte, Bit0), nur wenn vorhanden
-  var alarm = null;
-  if (bytes.length >= 10) {
-    alarm = bytes[9] & 0x01;
-    data.ALARM = alarm;
-  }
-
-  // ------------------------------------------------------------------
-  // Detail-Dekodierung je nach MOD
-  // payload format laut Dragino: 10 Byte
-  // [0..1]=Bat+Status, [2]=MOD, [3..5]=count, [6..8]=duration, [9]=alarm/reserved
-  // ------------------------------------------------------------------
-  if (bytes.length !== 10) {
-    warnings.push(
-      "Unexpected payload length " + bytes.length + " (expected 10 bytes for full decode)"
-    );
-    // Wir liefern trotzdem die Basiswerte zurück
-    return { data: data, warnings: warnings, errors: errors };
-  }
-
-  // nur wenn Byte0 im gültigen Bereich ist (Dragino Beispiel: 0x07 < b0 < 0x0F)
-  var header_ok = (bytes[0] > 0x07 && bytes[0] < 0x0F);
-  if (!header_ok) {
-    warnings.push("Header byte out of expected range: 0x" + bytes[0].toString(16));
-  }
-
-  // gemeinsame Zähl- und Dauerfelder
-  var count    = (bytes[3] << 16) | (bytes[4] << 8) | bytes[5];
-  var duration = (bytes[6] << 16) | (bytes[7] << 8) | bytes[8]; // Minuten
-
-  if (mod === 1) {
-    // Tür-Modus
-    data.DOOR_OPEN_TIMES          = count;
-    data.LAST_DOOR_OPEN_DURATION  = duration;   // Minuten
-    // ALARM ist oben bereits gesetzt (falls vorhanden)
-  } else if (mod === 2) {
-    // Leckage-Modus
-    data.WATER_LEAK_TIMES         = count;
-    data.LAST_WATER_LEAK_DURATION = duration;   // Minuten
-    // Alarm-Feld wird hier optional genutzt, falls vorhanden
-  } else if (mod === 3) {
-    // Kombinations-Modus (Türe + Leck)
-    // Dragino-Referenz-Dekoder liefert hier nur Status + Alarm,
-    // Zählfelder könnten je nach Firmware anders belegt sein.
-    // Wir belassen count/duration unbenutzt und geben nur Status/Alarm zurück.
-    // Falls gewünscht, könntest du hier zusätzliche Felder ergänzen.
-  } else {
-    warnings.push("Unknown MOD value: " + mod);
-  }
-
-  return {
-    data: data,
-    warnings: warnings,
-    errors: errors
-  };
+// Optional (keep simple)
+function encodeDownlink(input) {
+  return { bytes: [], fPort: 1 };
 }
